@@ -58,13 +58,6 @@ ANTIVIRALDB_RNA_VIRUS_LIST = [
     "Rotavirus"
 ]
 
-# 針對特定縮寫病毒（如 SARS-CoV-2, SARS-CoV, MERS-CoV）設定備用病毒全名對照表
-VIRUS_FULL_NAME_MAP = {
-    "SARS-CoV-2": "Severe acute respiratory syndrome coronavirus 2",
-    "SARS-CoV": "Severe acute respiratory syndrome coronavirus",
-    "MERS-CoV": "Middle East respiratory syndrome coronavirus"
-}
-
 PUBCHEM_PUG_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 NCBI_ESEARCH_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 
@@ -139,13 +132,9 @@ def fetch_compound_properties(cids: List[int]) -> List[Dict]:
     return all_properties
 
 
-def update_google_sheet_by_virus(virus_df_dict: Dict[str, pd.DataFrame], target_sheet_identifier: str = "RNA_Virus_RdRP_Inhibitors") -> None:
+def update_google_sheet_by_virus(virus_df_dict: Dict[str, pd.DataFrame], sheet_name: str = "RNA_Virus_RdRP_Inhibitors") -> None:
     """
-    將各病毒的搜尋結果與特定 Google Sheet 進行內容比對：
-    - 讀取既有工作表內容並與最新資料進行比對。
-    - 若內容完全相同，跳過不進行寫入。
-    - 若內容不相同或為新工作表，則以最新資料更新。
-    - 支援透過環境變數 GOOGLE_SHEET_ID 或 GOOGLE_SHEET_NAME 指定特定 Google Sheet 檔案。
+    將各病毒的搜尋結果分別寫入至 Google Sheet 中，並以各病毒名稱做為工作表 (Worksheet Tab) 命名。
     """
     if not GSPREAD_AVAILABLE:
         logging.warning("未安裝 gspread / google-auth 套件。請先執行 'pip install gspread google-auth'")
@@ -153,9 +142,6 @@ def update_google_sheet_by_virus(virus_df_dict: Dict[str, pd.DataFrame], target_
 
     creds_env = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     creds_filename = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
-    
-    # 支援優先讀取環境變數指定的特定 Google Sheet ID 或名稱
-    sheet_id_or_name = os.environ.get("GOOGLE_SHEET_ID", os.environ.get("GOOGLE_SHEET_NAME", target_sheet_identifier))
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -175,27 +161,21 @@ def update_google_sheet_by_virus(virus_df_dict: Dict[str, pd.DataFrame], target_
 
         client = gspread.authorize(creds)
 
-        # 開啟指定的特定 Google Sheet 檔案 (字串長度大於 25 且無斜線視為 Spreadsheet ID)
+        # 開啟試算表 (若不存在則自動新建)
         try:
-            if len(sheet_id_or_name) > 25 and "/" not in sheet_id_or_name:
-                spreadsheet = client.open_by_key(sheet_id_or_name)
-                logging.info(f"成功透過 ID 開啟目標特定 Google Sheet: '{spreadsheet.title}' (ID: {sheet_id_or_name})")
-            else:
-                spreadsheet = client.open(sheet_id_or_name)
-                logging.info(f"成功開啟特定名稱的 Google Sheet: '{sheet_id_or_name}'")
+            spreadsheet = client.open(sheet_name)
         except gspread.SpreadsheetNotFound:
-            # 若指定 ID/名稱找不到且為檔名，則自動建立新檔案
-            spreadsheet = client.create(sheet_id_or_name)
-            logging.info(f"已在 Google Drive 建立新的特定 Google Sheet 檔案: '{sheet_id_or_name}'")
+            spreadsheet = client.create(sheet_name)
+            logging.info(f"已在 Google Drive 建立新的 Google Sheet: {sheet_name}")
 
         existing_worksheets = {ws.title: ws for ws in spreadsheet.worksheets()}
 
-        # 逐一對比與更新各病毒名稱的工作表 (Worksheet Tab)
+        # 逐一針對每一種病毒更新對應名稱的工作表 (Worksheet)
         for virus_name, df in virus_df_dict.items():
             # Google Sheet 工作表名稱限制最多 100 個字元
             ws_title = virus_name[:100]
 
-            # 準備最新待寫入資料內容
+            # 轉換 DataFrame 格式寫入試算表
             if not df.empty:
                 data_to_write = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
             else:
@@ -210,28 +190,33 @@ def update_google_sheet_by_virus(virus_df_dict: Dict[str, pd.DataFrame], target_
                 try:
                     existing_data = worksheet.get_all_values()
                 except Exception as e:
-                    logging.warning(f"讀取既有工作表 [{ws_title}] 內容失敗: {e}")
+                    logging.warning(f"讀取工作表 [{ws_title}] 內容失敗: {e}")
                     existing_data = []
 
-                # 比對既有內容與最新資料是否完全一致
+                # 比對既有內容與最新資料是否相同
                 if existing_data == data_to_write:
                     logging.info(f"工作表 [{ws_title}] 內容無變動，跳過更新")
                     continue
                 else:
-                    # 檢測到內容不相同時，以最新資料進行更新
                     worksheet.clear()
                     worksheet.update(values=data_to_write, range_name="A1")
                     logging.info(f"工作表 [{ws_title}] 檢測到數據變更，已更新為最新版本（共 {len(df)} 筆資料）")
             else:
-                # 建立新的病毒工作表
                 rows_count = max(100, len(df) + 10)
                 worksheet = spreadsheet.add_worksheet(title=ws_title, rows=str(rows_count), cols="20")
                 existing_worksheets[ws_title] = worksheet
                 worksheet.update(values=data_to_write, range_name="A1")
                 logging.info(f"建立新工作表 [{ws_title}] 並寫入最新資料（共 {len(df)} 筆資料）")
 
-        logging.info(f"完成 Google Sheet 資料比對與同步更新: '{spreadsheet.title}'")
-        logging.info(f"檔案連結: {spreadsheet.url}")
+        # 若自動產生的預設空白 Sheet1 存在且已有其他病毒工作表，則進行清理
+        if "Sheet1" in existing_worksheets and len(spreadsheet.worksheets()) > 1:
+            try:
+                spreadsheet.del_worksheet(existing_worksheets["Sheet1"])
+            except Exception:
+                pass
+
+        logging.info(f"成功將所有病毒分頁資料同步至 Google Sheet: '{sheet_name}'")
+        logging.info(f"Sheet 連結: {spreadsheet.url}")
 
     except Exception as e:
         logging.error(f"寫入 Google Sheet 時發生錯誤: {e}")
@@ -239,8 +224,7 @@ def update_google_sheet_by_virus(virus_df_dict: Dict[str, pd.DataFrame], target_
 
 def collect_antiviraldb_rdrp_inhibitors() -> tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
-    依據 AntiviralDB RNA 病毒清單，逐一對每一種病毒搜尋 PubChem RdRP 抑制劑資料並依病毒分類。
-    若使用縮寫名稱（如 SARS-CoV-2, SARS-CoV, MERS-CoV）搜尋無結果，自動改用病毒全名進行備用搜尋。
+    依據 AntiviralDB RNA 病毒清單，逐一對每一種病毒搜尋 PubChem RdRP 抑制劑資料並依病毒分類
     """
     virus_to_cids: Dict[str, Set[int]] = {}
     all_unique_cids: Set[int] = set()
@@ -264,21 +248,6 @@ def collect_antiviraldb_rdrp_inhibitors() -> tuple[pd.DataFrame, Dict[str, pd.Da
             
             found_cids_for_virus.update(cids)
             time.sleep(0.25)  # 遵守 PubChem API 限速規範
-
-        # 若未找到結果且該病毒在全名對照表中（如 SARS-CoV-2, SARS-CoV, MERS-CoV），自動改用病毒全名進行備用搜尋
-        if not found_cids_for_virus and virus in VIRUS_FULL_NAME_MAP:
-            full_name = VIRUS_FULL_NAME_MAP[virus]
-            logging.info(f" -> 使用簡稱 '{virus}' 未找到結果，自動嘗試備用全名搜尋: '{full_name}'")
-            fallback_queries = [
-                f"{full_name} RdRP inhibitor",
-                f"{full_name} RNA-dependent RNA polymerase inhibitor"
-            ]
-            for query in fallback_queries:
-                cids = search_cids_via_esearch(query)
-                if not cids:
-                    cids = search_cids_via_pug_name(query)
-                found_cids_for_virus.update(cids)
-                time.sleep(0.25)
             
         virus_to_cids[virus] = found_cids_for_virus
         all_unique_cids.update(found_cids_for_virus)
@@ -377,8 +346,8 @@ def main():
     df_combined.to_csv(csv_filename, index=False, encoding="utf-8-sig")
     logging.info(f"成功將 {len(df_combined)} 筆 RdRP 抑制劑總合資料寫入至: {csv_filename}")
 
-    # 比對並更新至特定的 Google Sheet 檔案
-    update_google_sheet_by_virus(virus_df_dict, target_sheet_identifier="RNA_Virus_RdRP_Inhibitors")
+    # 自動覆寫同步至 Google Sheets，每個病毒獨立一個工作表 (Worksheet Tab)
+    update_google_sheet_by_virus(virus_df_dict, sheet_name="RNA_Virus_RdRP_Inhibitors")
 
 if __name__ == "__main__":
     main()
