@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas gspread google-auth
+          pip install requests pandas gspread google-auth 
 
       - name: Run script
         env:
