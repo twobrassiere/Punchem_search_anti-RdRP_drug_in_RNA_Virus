@@ -2,7 +2,8 @@ name: Daily AntiviralDB RdRP Google Sheet Sync
 
 on:
   schedule:
-    - cron: '0 0 * * *' # 每天 UTC 00:00 (台灣時間 08:00) 執行
+    # 每 12 小時執行一次 (UTC 00:00 與 12:00，相當於台灣時間 08:00 與 20:00)
+    - cron: '0 */12 * * *'
   workflow_dispatch:
 
 jobs:
@@ -19,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas gspread google-auth 
+          pip install requests pandas gspread google-auth tqdm
 
       - name: Run script
         env:
@@ -39,7 +40,8 @@ jobs:
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
           subject: "GitHub Action [${{ job.status }}]: Daily AntiviralDB RdRP Sync"
-          to: ${{ secrets.MAIL_TO }}
+          # 若 Secrets 中的 MAIL_TO 缺失，預設退回使用 MAIL_USERNAME 作為收件人，防止報錯
+          to: ${{ secrets.MAIL_TO || secrets.MAIL_USERNAME }}
           from: "GitHub Actions Automator <${{ secrets.MAIL_USERNAME }}>"
           body: |
             Daily AntiviralDB RdRP Google Sheet Sync 工作已完成。
