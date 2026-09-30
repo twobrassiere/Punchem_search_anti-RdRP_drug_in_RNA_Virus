@@ -227,6 +227,46 @@ def update_google_sheet(df):
 
     print(f"\n🎉 全數工作表同步完畢！(試算表 ID: {spreadsheet_id})")
 
+def generate_email_summary(df):
+    """分析抓取結果，並直接在 Console Log 輸出分析總結"""
+    total_records = len(df)
+    active_drugs = df[df["PubChem CID"] != "No Active Inhibitor Found"]
+    
+    summary_by_virus = active_drugs.groupby("Organism")["PubChem CID"].nunique()
+    
+    report_lines = [
+        "==========================================",
+        "  PubChem RNA 病毒 RdRP 抑制劑每日分析報告",
+        "==========================================",
+        f"📅 執行時間: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+        f"📊 總檢索紀錄數: {total_records} 筆",
+        f"💊 成功找到活性藥物/化合物的病毒數: {len(summary_by_virus)} 種",
+        "------------------------------------------\n",
+        "【各病毒有效抑制劑 (CID) 數量統計】:"
+    ]
+    
+    for virus, count in summary_by_virus.items():
+        report_lines.append(f"  • {virus}: {count} 個化合物")
+        
+    report_lines.extend([
+        "\n------------------------------------------",
+        "【活性類型 (Standard Type) 分布】:"
+    ])
+    
+    type_counts = active_drugs["Standard Type"].value_counts()
+    for stype, count in type_counts.items():
+        report_lines.append(f"  • {stype}: {count} 筆試驗數據")
+
+    report_lines.extend([
+        "\n------------------------------------------",
+        "🔗 最新數據已完整同步至 Google Sheet 試算表。",
+        "=========================================="
+    ])
+    
+    report_text = "\n".join(report_lines)
+    print("\n" + report_text)
+    return report_text
+
 def main():
     all_rows = []
     
@@ -265,7 +305,6 @@ def main():
             print(f"  ⚪ [PubChem] 原名稱無活性藥物，啟動 NCBI Virus 備援機制...")
             ncbi_official_name, tax_id = fetch_ncbi_virus_full_name(virus)
             
-            # 使用 NCBI 官方全名再次嘗試搜尋 PubChem
             if ncbi_official_name != virus:
                 retry_cids = get_cids_by_virus(ncbi_official_name)
                 for cid in retry_cids:
@@ -290,7 +329,6 @@ def main():
                                 "InChIKey": inchikey
                             })
 
-            # 若使用 NCBI 全名後依然查無抑制劑，寫入 NCBI 病毒基本 Taxonomy 記錄至 Google Sheet 備查
             if not assays_found:
                 uniprot_id, _ = get_uniprot_and_protein_id("", ncbi_official_name)
                 assays_found.append({
@@ -312,48 +350,7 @@ def main():
 
     df = pd.DataFrame(all_rows)
     update_google_sheet(df)
+    generate_email_summary(df)
 
-def generate_email_summary(df):
-    """分析抓取結果並產生報告寫入 data/email_summary.txt"""
-    os.makedirs("data", exist_ok=True)
-    
-    total_records = len(df)
-    active_drugs = df[df["PubChem CID"] != "No Active Inhibitor Found"]
-    
-    # 計算各病毒藥物統計
-    summary_by_virus = active_drugs.groupby("Organism")["PubChem CID"].nunique()
-    
-    report_lines = [
-        "==========================================",
-        "  PubChem RNA 病毒 RdRP 抑制劑每日分析報告",
-        "==========================================",
-        f"📅 執行時間: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
-        f"📊 總檢索紀錄數: {total_records} 筆",
-        f"💊 成功找到活性藥物/化合物的病毒數: {len(summary_by_virus)} 種",
-        "------------------------------------------\n",
-        "【各病毒有效抑制劑 (CID) 數量統計】:"
-    ]
-    
-    for virus, count in summary_by_virus.items():
-        report_lines.append(f"  • {virus}: {count} 個化合物")
-        
-    report_lines.extend([
-        "\n------------------------------------------",
-        "【活性類型 (Standard Type) 分布】:"
-    ])
-    
-    type_counts = active_drugs["Standard Type"].value_counts()
-    for stype, count in type_counts.items():
-        report_lines.append(f"  • {stype}: {count} 筆試驗數據")
-
-    report_lines.extend([
-        "\n------------------------------------------",
-        "🔗 最新數據已完整同步至 Google Sheet 試算表。",
-        "=========================================="
-    ])
-    
-    # 寫入文字檔供 GitHub Actions 讀取寄信
-    with open("data/email_summary.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(report_lines))
-        
-    print("✨ 已成功產生每日分析報告 data/email_summary.txt！")
+if __name__ == "__main__":
+    main()
