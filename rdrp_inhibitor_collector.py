@@ -6,7 +6,6 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
-# 根據 ASM mBio (10.1128/mbio.02013-25) 整理之主要 RNA 病毒清單
 ORGANISM_LIST = [
     # Coronaviridae (冠狀病毒科)
     'SARS-CoV-2', 
@@ -60,33 +59,57 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-# 計數器：用於實現「每 3 次查詢暫停 3 秒」
 request_counter = 0
 
 def rate_limit_control():
-    """控制每查詢 3 次自動暫停 3 秒"""
+    """控制每 3 次查詢自動暫停 3 秒"""
     global request_counter
     request_counter += 1
     if request_counter % 3 == 0:
-        print("  ⏳ [Rate Limit] 已執行 3 次查詢，自動暫停 3 秒...")
+        print("  ⏳ [Rate Limit] 已執行 3 次 API 查詢，自動暫停 3 秒...")
         time.sleep(3)
 
-def get_cids_by_virus(virus_name, max_results=20):
-    """根據 RNA 病毒名稱搜尋 PubChem 中對應的 RdRP 抑制劑 CID"""
+def fetch_ncbi_virus_full_name(virus_name):
+    """【備援機制】向 NCBI Taxonomy / Entrez API 查詢病毒官方完整名稱與 TaxID"""
     rate_limit_control()
-    query = f"{virus_name} RdRP inhibitor"
+    print(f"  🔍 [NCBI Virus] 正在至 NCBI Taxonomy 檢索病毒完整名稱: {virus_name} ...")
+    
+    search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=taxonomy&term={virus_name}&retmode=json"
+    try:
+        res = requests.get(search_url, timeout=10)
+        if res.status_code == 200:
+            id_list = res.json().get("esearchresult", {}).get("idlist", [])
+            if id_list:
+                tax_id = id_list[0]
+                rate_limit_control()
+                summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=taxonomy&id={tax_id}&retmode=json"
+                sum_res = requests.get(summary_url, timeout=10)
+                if sum_res.status_code == 200:
+                    result = sum_res.json().get("result", {}).get(tax_id, {})
+                    official_name = result.get("scientificname", virus_name)
+                    print(f"  ✨ [NCBI Virus] 取得 NCBI 官方全名: {official_name} (TaxID: {tax_id})")
+                    return official_name, tax_id
+    except Exception as e:
+        print(f"  ⚠️ [NCBI Virus] 查詢失敗: {e}")
+    
+    return virus_name, "N/A"
+
+def get_cids_by_virus(query_term, max_results=20):
+    """根據關鍵字搜尋 PubChem CID"""
+    rate_limit_control()
+    query = f"{query_term} RdRP inhibitor"
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{query}/cids/JSON"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
             return data.get("IdentifierList", {}).get("CID", [])[:max_results]
-    except Exception as e:
-        print(f"[{virus_name}] 搜尋 CID 失敗: {e}")
+    except Exception:
+        pass
     return []
 
 def get_compound_structures(cid):
-    """獲取化合物結構資訊：Canonical SMILES 與 InChIKey"""
+    """獲取化合物結構資訊：SMILES 與 InChIKey"""
     rate_limit_control()
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/CanonicalSMILES,InChIKey/JSON"
     try:
@@ -99,7 +122,7 @@ def get_compound_structures(cid):
     return "", ""
 
 def get_bioassay_data(cid):
-    """取得 CID 的生物活性數據，僅留下明確有抑制劑數值 (IC50, EC50, Ki, Kd) 的紀錄"""
+    """取得 CID 的生物活性數據 (IC50, EC50, Ki, Kd)"""
     rate_limit_control()
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/assaysummary/JSON"
     records = []
@@ -124,7 +147,6 @@ def get_bioassay_data(cid):
                 activity_type = cell[i_type] if i_type != -1 and i_type < len(cell) else ""
                 activity_val = cell[i_val] if i_val != -1 and i_val < len(cell) else ""
                 
-                # 只有活性數值不為空，且屬於 IC50/EC50/Ki/Kd 才視為有效抑制劑紀錄
                 if activity_type.upper() in ["IC50", "EC50", "KI", "KD"] and str(activity_val).strip() != "":
                     records.append({
                         "Target Name": cell[i_target] if i_target != -1 and i_target < len(cell) else "",
@@ -134,8 +156,8 @@ def get_bioassay_data(cid):
                         "Standard Relation": cell[i_relation] if i_relation != -1 and i_relation < len(cell) else "",
                         "NCBI Gene ID": cell[i_gene] if i_gene != -1 and i_gene < len(cell) else ""
                     })
-    except Exception as e:
-        print(f"獲取 CID {cid} Bioassay 失敗: {e}")
+    except Exception:
+        pass
     return records
 
 def get_uniprot_and_protein_id(gene_id, virus_name):
@@ -168,9 +190,9 @@ def get_uniprot_and_protein_id(gene_id, virus_name):
     return "N/A", "N/A"
 
 def update_google_sheet(df):
-    """按病毒名稱分組，僅將「確定有抑制劑數據」的病毒寫入 Google Sheet 獨立工作表」"""
+    """將資料依病毒名稱分別存入獨立的工作表中"""
     if df.empty:
-        print("⚠️ 未找到任何帶有有效活性數據的抑制劑，取消更新 Google Sheet。")
+        print("⚠️ 未抓取到任何資料，取消更新 Google Sheet。")
         return
 
     creds_json_str = os.environ.get("GCP_SA_KEY")
@@ -201,30 +223,29 @@ def update_google_sheet(df):
         data_to_write = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
         
         worksheet.update(data_to_write)
-        print(f"✅ 已成功將 {len(group_df)} 筆抑制劑數據存入工作表 [{sheet_title}]")
+        print(f"✅ 已成功更新工作表 [{sheet_title}] (共 {len(group_df)} 筆資料)")
 
-    print(f"\n🎉 含有抑制劑數據的病毒分頁更新完畢！(試算表 ID: {spreadsheet_id})")
+    print(f"\n🎉 全數工作表同步完畢！(試算表 ID: {spreadsheet_id})")
 
 def main():
     all_rows = []
     
     for virus in ORGANISM_LIST:
-        print(f"\n正在查詢 RNA 病毒: {virus} ...")
+        print(f"\n==========================================")
+        print(f"正在查詢 RNA 病毒: {virus} ...")
+        
+        # 1. 第一階段：以原本名稱查詢 PubChem
         cids = get_cids_by_virus(virus)
-        
-        virus_inhibitors_found = 0
-        
+        assays_found = []
+
         for cid in cids:
             assays = get_bioassay_data(cid)
-            
-            # 關鍵修改：只有當 assays 非空（代表該 CID 確實有發布抑制劑活性數據）時才進行處理解析
             if assays:
                 smiles, inchikey = get_compound_structures(cid)
-                for assay in assays[:2]: # 每個化合物最多擷取前 2 筆關聯性高的數據
+                for assay in assays[:2]:
                     gene_id = assay["NCBI Gene ID"]
                     uniprot_id, ncbi_protein_id = get_uniprot_and_protein_id(gene_id, virus)
-                    
-                    all_rows.append({
+                    assays_found.append({
                         "Organism": virus,
                         "Target Name": assay["Target Name"] or "RdRP Polymerase",
                         "UniProt ID": uniprot_id,
@@ -238,12 +259,56 @@ def main():
                         "Canonical SMILES": smiles,
                         "InChIKey": inchikey
                     })
-                    virus_inhibitors_found += 1
 
-        if virus_inhibitors_found > 0:
-            print(f"  👉 [{virus}] 找到 {virus_inhibitors_found} 筆有效抑制劑資料，準備寫入！")
-        else:
-            print(f"  ⚪ [{virus}] 未發現帶有明確活性數據的抑制劑，跳過此病毒。")
+        # 2. 第二階段：若查無活性藥物，觸發 NCBI Virus (Entrez API) 檢索
+        if not assays_found:
+            print(f"  ⚪ [PubChem] 原名稱無活性藥物，啟動 NCBI Virus 備援機制...")
+            ncbi_official_name, tax_id = fetch_ncbi_virus_full_name(virus)
+            
+            # 使用 NCBI 官方全名再次嘗試搜尋 PubChem
+            if ncbi_official_name != virus:
+                retry_cids = get_cids_by_virus(ncbi_official_name)
+                for cid in retry_cids:
+                    retry_assays = get_bioassay_data(cid)
+                    if retry_assays:
+                        smiles, inchikey = get_compound_structures(cid)
+                        for assay in retry_assays[:2]:
+                            gene_id = assay["NCBI Gene ID"]
+                            uniprot_id, ncbi_protein_id = get_uniprot_and_protein_id(gene_id, ncbi_official_name)
+                            assays_found.append({
+                                "Organism": virus,
+                                "Target Name": f"{assay['Target Name']} (NCBI: {ncbi_official_name})",
+                                "UniProt ID": uniprot_id,
+                                "NCBI Gene ID": gene_id or "N/A",
+                                "NCBI Protein ID": ncbi_protein_id,
+                                "PubChem CID": str(cid),
+                                "Standard Type": assay["Standard Type"],
+                                "Standard Value": str(assay["Standard Value"]),
+                                "Standard Units": assay["Standard Units"],
+                                "Standard Relation": assay["Standard Relation"],
+                                "Canonical SMILES": smiles,
+                                "InChIKey": inchikey
+                            })
+
+            # 若使用 NCBI 全名後依然查無抑制劑，寫入 NCBI 病毒基本 Taxonomy 記錄至 Google Sheet 備查
+            if not assays_found:
+                uniprot_id, _ = get_uniprot_and_protein_id("", ncbi_official_name)
+                assays_found.append({
+                    "Organism": virus,
+                    "Target Name": f"RNA-dependent RNA polymerase ({ncbi_official_name})",
+                    "UniProt ID": uniprot_id,
+                    "NCBI Gene ID": f"NCBI_TaxID:{tax_id}",
+                    "NCBI Protein ID": "N/A",
+                    "PubChem CID": "No Active Inhibitor Found",
+                    "Standard Type": "N/A",
+                    "Standard Value": "N/A",
+                    "Standard Units": "N/A",
+                    "Standard Relation": "N/A",
+                    "Canonical SMILES": "N/A",
+                    "InChIKey": "N/A"
+                })
+
+        all_rows.extend(assays_found)
 
     df = pd.DataFrame(all_rows)
     update_google_sheet(df)
