@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 import random
 import requests
 import pandas as pd
@@ -47,7 +48,7 @@ ORGANISM_LIST = [
     # Rhabdoviridae, Filoviridae & Arenaviridae (線狀、絲狀與沙狀病毒科)
     'Rabies virus', 
     'Ebola virus', 
-    'Marburg virus',
+    'Marburg virus', 
     'Lassa virus', 
     'Crimean-Congo hemorrhagic fever virus',
 
@@ -63,7 +64,7 @@ SCOPES = [
 request_counter = 0
 
 def rate_limit_control():
-    """控制每 3 次查詢自動暫停 3 秒"""
+    """控制每 3 次 API 查詢自動暫停 3 秒"""
     global request_counter
     request_counter += 1
     if request_counter % 3 == 0:
@@ -71,7 +72,7 @@ def rate_limit_control():
         time.sleep(3)
 
 def fetch_ncbi_virus_full_name(virus_name):
-    """【備援機制 1】向 NCBI Taxonomy / Entrez API 查詢病毒官方完整名稱與 TaxID"""
+    """【備援機制】向 NCBI Taxonomy API 查詢病毒官方完整名稱與 TaxID"""
     rate_limit_control()
     print(f"  🔍 [NCBI Virus] 正在至 NCBI Taxonomy 檢索病毒完整名稱: {virus_name} ...")
     
@@ -94,6 +95,89 @@ def fetch_ncbi_virus_full_name(virus_name):
         print(f"  ⚠️ [NCBI Virus] 查詢失敗: {e}")
     
     return virus_name, "N/A"
+
+def extract_mutations_from_text(text):
+    """從文獻摘要中抓取潛在的 RdRP 胺基酸突變點 (例如: S759A, V557L, F480L)"""
+    if not text:
+        return "None Found"
+    pattern = r'\b[A-Z]\d{2,4}[A-Z]\b'
+    matches = re.findall(pattern, text)
+    filtered = [m for m in set(matches) if not m.startswith(('IC', 'EC', 'KI', 'KD'))]
+    return ", ".join(filtered) if filtered else "None Detected"
+
+def search_smiles_by_compound_name(compound_name):
+    """利用化合物名稱查詢 PubChem 取得 Canonical SMILES 與 InChIKey"""
+    if not compound_name or len(compound_name) < 3:
+        return "N/A", "N/A"
+    rate_limit_control()
+    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{compound_name}/property/CanonicalSMILES,InChIKey/JSON"
+    try:
+        res = requests.get(url, timeout=8)
+        if res.status_code == 200:
+            props = res.json().get("PropertyTable", {}).get("Properties", [])[0]
+            return props.get("CanonicalSMILES", "N/A"), props.get("InChIKey", "N/A")
+    except Exception:
+        pass
+    return "N/A", "N/A"
+
+def fetch_pubmed_articles(virus_name, max_results=3):
+    """向 PubMed 檢索文獻、提取生物活性、突變點 (Mutations) 及 SMILES"""
+    rate_limit_control()
+    print(f"  📚 [PubMed] 正在至 PubMed 資料庫搜尋 {virus_name} RdRP inhibitor / antiviral activity 文獻 ...")
+    records = []
+    
+    term = f"({virus_name}[Title/Abstract]) AND (RdRP inhibitor OR antiviral activity)"
+    search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={term}&retmode=json&retmax={max_results}"
+    
+    try:
+        res = requests.get(search_url, timeout=10)
+        if res.status_code == 200:
+            id_list = res.json().get("esearchresult", {}).get("idlist", [])
+            if id_list:
+                pmids = ",".join(id_list)
+                rate_limit_control()
+                summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmids}&retmode=xml"
+                fetch_res = requests.get(summary_url, timeout=12)
+                
+                if fetch_res.status_code == 200:
+                    xml_content = fetch_res.text
+                    for pmid in id_list:
+                        title_match = re.search(r'<ArticleTitle>(.*?)</ArticleTitle>', xml_content, re.DOTALL)
+                        abstract_match = re.search(r'<AbstractText.*?>(.*?)</AbstractText>', xml_content, re.DOTALL)
+                        
+                        title = title_match.group(1) if title_match else "Literature Search Result"
+                        abstract = abstract_match.group(1) if abstract_match else ""
+                        
+                        mutations = extract_mutations_from_text(f"{title} {abstract}")
+                        
+                        smiles, inchikey = "N/A", "N/A"
+                        words = re.findall(r'\b[A-Za-z0-9\-]{4,20}\b', title)
+                        for word in words:
+                            if word.lower() not in ['virus', 'rdrp', 'inhibitor', 'activity', 'antiviral', 'sars', 'cov']:
+                                smiles, inchikey = search_smiles_by_compound_name(word)
+                                if smiles != "N/A":
+                                    break
+
+                        records.append({
+                            "Organism": virus_name,
+                            "Target Name": f"Literature: {title[:70]}...",
+                            "RdRP Mutation": mutations,  # 📍 放在 Target Name 下一欄
+                            "UniProt ID": "N/A",
+                            "NCBI Gene ID": f"PubMed_PMID:{pmid}",
+                            "NCBI Protein ID": "N/A",
+                            "PubChem CID": f"PubMed:{pmid}",
+                            "Standard Type": "Literature Assay",
+                            "Standard Value": f"PMID:{pmid}",
+                            "Standard Units": "PubMed Record",
+                            "Standard Relation": "=",
+                            "Canonical SMILES": smiles,
+                            "InChIKey": inchikey
+                        })
+                print(f"  ✨ [PubMed] 成功擷取 {len(records)} 筆文獻，已自動提取突變點與 SMILES！")
+    except Exception as e:
+        print(f"  ⚠️ [PubMed] 檢索失敗: {e}")
+        
+    return records
 
 def get_cids_by_virus(query_term, max_results=20):
     """根據關鍵字搜尋 PubChem CID"""
@@ -151,6 +235,7 @@ def get_bioassay_data(cid):
                 if activity_type.upper() in ["IC50", "EC50", "KI", "KD"] and str(activity_val).strip() != "":
                     records.append({
                         "Target Name": cell[i_target] if i_target != -1 and i_target < len(cell) else "",
+                        "RdRP Mutation": "N/A",  # 📍 放在 Target Name 下一欄
                         "Standard Type": activity_type,
                         "Standard Value": activity_val,
                         "Standard Units": cell[i_unit] if i_unit != -1 and i_unit < len(cell) else "",
@@ -187,6 +272,7 @@ def get_chembl_activity_data(virus_name, max_results=5):
                     records.append({
                         "Organism": virus_name,
                         "Target Name": f"{target_pref_name} (ChEMBL)",
+                        "RdRP Mutation": "N/A",  # 📍 放在 Target Name 下一欄
                         "UniProt ID": act.get("target_chembl_id", "N/A"),
                         "NCBI Gene ID": "N/A",
                         "NCBI Protein ID": "N/A",
@@ -235,7 +321,7 @@ def get_uniprot_and_protein_id(gene_id, virus_name):
     return "N/A", "N/A"
 
 def update_google_sheet(df):
-    """將單一病毒的最新數據更新至 Google Sheet 中的專屬工作表 (Worksheet)"""
+    """將單一抽樣病毒的資料更新寫入至對應的 Google Sheet 工作表中"""
     if df.empty:
         print("⚠️ 未抓取到任何資料，取消更新 Google Sheet。")
         return
@@ -259,10 +345,9 @@ def update_google_sheet(df):
         if sheet_title in existing_worksheets:
             worksheet = existing_worksheets[sheet_title]
         else:
-            worksheet = sh.add_worksheet(title=sheet_title, rows=100, cols=20)
+            worksheet = sh.add_worksheet(title=sheet_title, rows=100, cols=25)
             existing_worksheets[sheet_title] = worksheet
         
-        # 清空該病毒對應的工作表並寫入最新搜尋結果
         worksheet.clear()
 
         df_clean = group_df.fillna("")
@@ -271,33 +356,31 @@ def update_google_sheet(df):
         worksheet.update(data_to_write)
         print(f"✅ 已成功更新工作表 [{sheet_title}] (共 {len(group_df)} 筆資料)")
 
-    print(f"\n🎉 Google Sheet 單一病毒工作表同步完畢！(試算表 ID: {spreadsheet_id})")
+    print(f"\n🎉 單選病毒工作表同步完畢！(試算表 ID: {spreadsheet_id})")
 
-def generate_email_summary(df, virus_name):
-    """分析本次抽查的病毒結果，並在 Console Log 輸出總結"""
+def generate_email_summary(df, selected_virus):
+    """分析抓取結果，並在 Console Log 輸出分析總結"""
     total_records = len(df)
     active_drugs = df[df["PubChem CID"] != "No Active Inhibitor Found"]
     
     report_lines = [
         "==========================================",
-        "  PubChem / ChEMBL 隨機抽查病毒每日報告",
+        "  PubChem / ChEMBL / PubMed 隨機抽樣每日分析報告",
         "==========================================",
-        f"🎲 本次抽查病毒: {virus_name}",
         f"📅 執行時間: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+        f"🎯 今日抽樣病毒: {selected_virus}",
         f"📊 總檢索紀錄數: {total_records} 筆",
-        f"💊 有效化合物數量: {active_drugs['PubChem CID'].nunique()} 個",
-        "------------------------------------------"
+        "------------------------------------------\n",
+        "【數據來源與活性類型 (Standard Type) 分布】:"
     ]
     
-    if not active_drugs.empty:
-        report_lines.append("【活性類型 (Standard Type) 分布】:")
-        type_counts = active_drugs["Standard Type"].value_counts()
-        for stype, count in type_counts.items():
-            report_lines.append(f"  • {stype}: {count} 筆試驗數據")
+    type_counts = active_drugs["Standard Type"].value_counts()
+    for stype, count in type_counts.items():
+        report_lines.append(f"  • {stype}: {count} 筆紀錄")
 
     report_lines.extend([
-        "------------------------------------------",
-        "🔗 最新數據已同步至 Google Sheet 對應的工作表。",
+        "\n------------------------------------------",
+        "🔗 最新數據已完整同步至 Google Sheet 試算表。",
         "=========================================="
     ])
     
@@ -306,16 +389,15 @@ def generate_email_summary(df, virus_name):
     return report_text
 
 def main():
-    # 🎲 關鍵改動：每次執行時，從 ORGANISM_LIST 隨機挑選 1 種病毒
-    selected_virus = random.choice(ORGANISM_LIST)
-    
-    print(f"==========================================")
-    print(f"🎲 隨機抽中本次檢索病毒: {selected_virus}")
-    print(f"==========================================")
-    
     all_rows = []
     
-    # 1. 第一階段：以原本名稱查詢 PubChem
+    selected_virus = random.choice(ORGANISM_LIST)
+    
+    print(f"\n==========================================")
+    print(f"🎲 今日隨機抽樣搜尋 RNA 病毒: {selected_virus} ...")
+    print(f"==========================================")
+    
+    # 1. PubChem BioAssay 檢索
     cids = get_cids_by_virus(selected_virus)
     assays_found = []
 
@@ -323,12 +405,13 @@ def main():
         assays = get_bioassay_data(cid)
         if assays:
             smiles, inchikey = get_compound_structures(cid)
-            for assay in assays[:2]:
+            for assay in assays[:3]:
                 gene_id = assay["NCBI Gene ID"]
                 uniprot_id, ncbi_protein_id = get_uniprot_and_protein_id(gene_id, selected_virus)
                 assays_found.append({
                     "Organism": selected_virus,
                     "Target Name": assay["Target Name"] or "RdRP Polymerase",
+                    "RdRP Mutation": "N/A",  # 📍 放在 Target Name 下一欄
                     "UniProt ID": uniprot_id,
                     "NCBI Gene ID": gene_id or "N/A",
                     "NCBI Protein ID": ncbi_protein_id,
@@ -341,56 +424,38 @@ def main():
                     "InChIKey": inchikey
                 })
 
-    # 2. 第二階段：併行/備援查詢 ChEMBL 資料庫
+    # 2. ChEMBL 檢索
     chembl_records = get_chembl_activity_data(selected_virus)
     if chembl_records:
         assays_found.extend(chembl_records)
 
-    # 3. 第三階段：若 PubChem 與 ChEMBL 皆無活性藥物，觸發 NCBI Virus (Entrez API) 檢索
+    # 3. PubMed 檢索
     if not assays_found:
-        print(f"  ⚪ [PubChem/ChEMBL] 原名稱無活性藥物，啟動 NCBI Virus 備援機制...")
-        ncbi_official_name, tax_id = fetch_ncbi_virus_full_name(selected_virus)
-        
-        if ncbi_official_name != selected_virus:
-            retry_cids = get_cids_by_virus(ncbi_official_name)
-            for cid in retry_cids:
-                retry_assays = get_bioassay_data(cid)
-                if retry_assays:
-                    smiles, inchikey = get_compound_structures(cid)
-                    for assay in retry_assays[:2]:
-                        gene_id = assay["NCBI Gene ID"]
-                        uniprot_id, ncbi_protein_id = get_uniprot_and_protein_id(gene_id, ncbi_official_name)
-                        assays_found.append({
-                            "Organism": selected_virus,
-                            "Target Name": f"{assay['Target Name']} (NCBI: {ncbi_official_name})",
-                            "UniProt ID": uniprot_id,
-                            "NCBI Gene ID": gene_id or "N/A",
-                            "NCBI Protein ID": ncbi_protein_id,
-                            "PubChem CID": str(cid),
-                            "Standard Type": assay["Standard Type"],
-                            "Standard Value": str(assay["Standard Value"]),
-                            "Standard Units": assay["Standard Units"],
-                            "Standard Relation": assay["Standard Relation"],
-                            "Canonical SMILES": smiles,
-                            "InChIKey": inchikey
-                        })
+        print(f"  ⚪ [PubChem/ChEMBL] 無具體數據，啟動 PubMed 文獻檢索機制...")
+        pubmed_records = fetch_pubmed_articles(selected_virus)
+        if pubmed_records:
+            assays_found.extend(pubmed_records)
 
-        if not assays_found:
-            uniprot_id, _ = get_uniprot_and_protein_id("", ncbi_official_name)
-            assays_found.append({
-                "Organism": selected_virus,
-                "Target Name": f"RNA-dependent RNA polymerase ({ncbi_official_name})",
-                "UniProt ID": uniprot_id,
-                "NCBI Gene ID": f"NCBI_TaxID:{tax_id}",
-                "NCBI Protein ID": "N/A",
-                "PubChem CID": "No Active Inhibitor Found",
-                "Standard Type": "N/A",
-                "Standard Value": "N/A",
-                "Standard Units": "N/A",
-                "Standard Relation": "N/A",
-                "Canonical SMILES": "N/A",
-                "InChIKey": "N/A"
-            })
+    # 4. NCBI Virus Taxonomy 備援
+    if not assays_found:
+        print(f"  ⚪ [PubMed] 無論文，啟動 NCBI Virus Taxonomy 備援機制...")
+        ncbi_official_name, tax_id = fetch_ncbi_virus_full_name(selected_virus)
+        uniprot_id, _ = get_uniprot_and_protein_id("", ncbi_official_name)
+        assays_found.append({
+            "Organism": selected_virus,
+            "Target Name": f"RNA-dependent RNA polymerase ({ncbi_official_name})",
+            "RdRP Mutation": "N/A",  # 📍 放在 Target Name 下一欄
+            "UniProt ID": uniprot_id,
+            "NCBI Gene ID": f"NCBI_TaxID:{tax_id}",
+            "NCBI Protein ID": "N/A",
+            "PubChem CID": "No Active Inhibitor Found",
+            "Standard Type": "N/A",
+            "Standard Value": "N/A",
+            "Standard Units": "N/A",
+            "Standard Relation": "N/A",
+            "Canonical SMILES": "N/A",
+            "InChIKey": "N/A"
+        })
 
     all_rows.extend(assays_found)
 
