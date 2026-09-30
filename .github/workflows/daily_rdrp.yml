@@ -29,7 +29,7 @@ jobs:
         GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       run: |
-        python scripts/fetch_rdrp_inhibitors.py
+        python rdrp_inhibitor_collector.py
 
     # 成功後：寄送分析摘要報告 Email
     - name: Send Summary Email on Success
