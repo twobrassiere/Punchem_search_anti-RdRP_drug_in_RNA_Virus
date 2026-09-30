@@ -1,38 +1,42 @@
-name: Daily PubChem RdRP Inhibitor to Google Sheet & Email Report
+name: Daily PubChem & ChEMBL RdRP Inhibitor Collector
 
 on:
   schedule:
-    # 每天台灣時間 08:00 (UTC 00:00) 執行
+    # 每天台灣時間 08:00 (UTC 00:00) 自動執行
     - cron: '0 0 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # 支援在 GitHub 網頁介面上手動點擊按鈕觸發執行
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
 
     steps:
+    # 1. 檢出儲存庫專案程式碼
     - name: Checkout Repository
       uses: actions/checkout@v4
 
+    # 2. 設定 Python 環境 (3.10)
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
+    # 3. 安裝依賴套件 (requests, pandas, gspread, google-auth)
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests pandas gspread google-auth
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests pandas gspread google-auth; fi
 
-    - name: Run Fetch Script, Update Sheet & Generate Summary
+    # 4. 執行隨機挑選病毒並抓取 PubChem/ChEMBL/NCBI 資料與寫入 Google Sheet
+    - name: Run Fetch Script and Update Google Sheet
       env:
         GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       run: |
         python rdrp_inhibitor_collector.py
 
-    # 成功後：寄送分析摘要報告 Email
-    - name: Send Summary Email on Success
+    # 5. 成功後寄送 Email 通知
+    - name: Send Email Notification on Success
       if: success()
       uses: dawidd6/action-send-mail@v3
       with:
@@ -40,12 +44,12 @@ jobs:
         server_port: 465
         username: ${{ secrets.MAIL_USERNAME }}
         password: ${{ secrets.MAIL_PASSWORD }}
-        subject: "📊 [每日自動報告] PubChem RNA 病毒 RdRP 抑制劑更新與數據分析"
+        subject: "📊 [自動化任務成功] RNA 病毒 RdRP 抑制劑試算表更新完成"
         to: ${{ secrets.RECEIVER_EMAIL }}
         from: "PubChem Automation Bot"
-        body: file://data/email_summary.txt # 讀取 Python 產出的分析報告檔案
+        body: "最新隨機抽查的 RNA 病毒 RdRP 抑制劑與活性數據已順利寫入 Google Sheet 對應分頁！"
 
-    # 失敗時：改用原生 cURL 直接發送 Discord Webhook 通知（最穩定、無套件相容問題）
+    # 6. 失敗時透過 cURL 發送 Discord Webhook 通知
     - name: Send Discord Notification on Failure
       if: failure()
       env:
@@ -54,8 +58,8 @@ jobs:
         if [ -n "$DISCORD_WEBHOOK" ]; then
           curl -H "Content-Type: application/json" \
                -X POST \
-               -d '{"content": "🚨 **[PubChem to Google Sheet 執行失敗]**\n請前往 GitHub Actions 查看詳細執行 Log。"}' \
+               -d '{"content": "🚨 **[RdRP Collector 執行失敗]**\n請檢查 GCP_SA_KEY、GOOGLE_SHEET_ID 或前往 GitHub Actions 查看失敗 Log。"}' \
                "$DISCORD_WEBHOOK"
         else
-          echo "DISCORD_WEBHOOK 未設定，跳過發送 Discord 訊息。"
+          echo "未偵測到 DISCORD_WEBHOOK Secret，跳過 Discord 提醒。"
         fi
