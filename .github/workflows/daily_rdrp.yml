@@ -22,7 +22,7 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install requests pandas gspread google-auth
 
     - name: Run Fetch Script, Update Sheet & Generate Summary
       env:
@@ -45,10 +45,17 @@ jobs:
         from: "PubChem Automation Bot"
         body: file://data/email_summary.txt # 讀取 Python 產出的分析報告檔案
 
-    # 失敗時：發送 Discord 失敗提醒
+    # 失敗時：改用原生 cURL 直接發送 Discord Webhook 通知（最穩定、無套件相容問題）
     - name: Send Discord Notification on Failure
       if: failure()
-      uses: IlshatSk/discord-webhook-action@v1.0.0
-      with:
-        webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
-        content: "🚨 **[PubChem to Google Sheet 執行失敗]**\n請前往 GitHub Actions 查看 Log。"
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      run: |
+        if [ -n "$DISCORD_WEBHOOK" ]; then
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d '{"content": "🚨 **[PubChem to Google Sheet 執行失敗]**\n請前往 GitHub Actions 查看詳細執行 Log。"}' \
+               "$DISCORD_WEBHOOK"
+        else
+          echo "DISCORD_WEBHOOK 未設定，跳過發送 Discord 訊息。"
+        fi
