@@ -64,14 +64,14 @@ SCOPES = [
 request_counter = 0
 
 def rate_limit_control():
-    """配合 API 規範微幅延遲，避免連線失敗"""
+    """配合 API 規範微幅延遲，避免 API 請求過快失敗"""
     global request_counter
     request_counter += 1
     if request_counter % 3 == 0:
-        time.sleep(1)
+        time.sleep(0.5)
 
 def extract_mutations_from_text(text):
-    """從文獻全文/摘要中提取 RdRP 胺基酸突變點 (如 S759A, V557L, F480L, C481S)"""
+    """從文獻全文/摘要中提取 RdRP 胺基酸突變點 (如 S759A, V557L, F480L)"""
     if not text:
         return "None Found"
     pattern = r'\b[A-Z]\d{2,4}[A-Z]\b'
@@ -82,9 +82,8 @@ def extract_mutations_from_text(text):
 def extract_bioactivity_from_text(text):
     """從文獻摘要中抓取 IC50 / EC50 生物活性數值與單位"""
     if not text:
-        return "N/A", "N/A", "N/A"
+        return "N/A", "N/A", "N/A", "="
     
-    # 抓取如 IC50 = 2.5 uM, EC50 of 15 nM, Ki: 0.8 uM 等數值
     pattern = r'\b(IC50|EC50|Ki|Kd)\b\s*(=|:|of|is|around)?\s*([0-9\.]+\s*(?:uM|nM|mM|µM))'
     match = re.search(pattern, text, re.IGNORECASE)
     if match:
@@ -95,7 +94,7 @@ def extract_bioactivity_from_text(text):
         unit = val_unit[1] if len(val_unit) > 1 else "uM"
         return act_type, val, unit, relation
     
-    return "Literature Assay", "N/A", "N/A", "="
+    return "N/A", "N/A", "N/A", "="
 
 def search_smiles_by_compound_name(compound_name):
     """利用化合物名稱查詢 PubChem 取得 Canonical SMILES 與 InChIKey"""
@@ -112,16 +111,17 @@ def search_smiles_by_compound_name(compound_name):
         pass
     return "N/A", "N/A"
 
-def fetch_pubmed_until_found(virus_name, target_count=5):
-    """【無上限搜尋】持續翻頁查詢 PubMed API，直到搜集到指定數量（預設 5 筆）具備活性資訊或結構的文獻資料為止"""
-    print(f"  📚 [PubMed] 啟動持續檢索模式（直至找到 {virus_name} RdRP inhibitor 相關文獻為止）...")
+def fetch_pubmed_until_found(virus_name):
+    """【無上限全量搜尋】持續翻頁查詢 PubMed API，直到掃描完所有文獻，搜集所有具備活性資訊或結構的資料為止"""
+    print(f"  📚 [PubMed] 啟動全量檢索模式：掃描 {virus_name} RdRP inhibitor 所有文獻...")
     records = []
     
     term = f"({virus_name}[Title/Abstract]) AND (RdRP inhibitor)"
     retstart = 0
-    batch_size = 20  # 每次取得 20 篇進行深入解析
+    batch_size = 20  # 每頁拉取 20 篇進行 XML 解析
+    total_found_in_pubmed = None
 
-    while len(records) < target_count:
+    while True:
         rate_limit_control()
         search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={term}&retmode=json&retmax={batch_size}&retstart={retstart}"
         
@@ -130,9 +130,14 @@ def fetch_pubmed_until_found(virus_name, target_count=5):
             if res.status_code != 200:
                 break
                 
-            id_list = res.json().get("esearchresult", {}).get("idlist", [])
-            if not id_list:
-                print("  ⚠️ [PubMed] 已搜尋完畢所有相關文獻。")
+            esearch_data = res.json().get("esearchresult", {})
+            if total_found_in_pubmed is None:
+                total_found_in_pubmed = int(esearch_data.get("count", 0))
+                print(f"  ℹ️ [PubMed] 數據庫中符合條件之文獻總數: {total_found_in_pubmed} 篇")
+
+            id_list = esearch_data.get("idlist", [])
+            if not id_list or retstart >= total_found_in_pubmed:
+                print("  🏁 [PubMed] 已完成所有頁面掃描。")
                 break
             
             pmids = ",".join(id_list)
@@ -142,9 +147,8 @@ def fetch_pubmed_until_found(virus_name, target_count=5):
             
             if fetch_res.status_code == 200:
                 xml_content = fetch_res.text
-                
-                # 依 PMID 分塊解析
                 articles = xml_content.split('<PubmedArticle>')
+                
                 for article_xml in articles[1:]:
                     pmid_match = re.search(r'<PMID.*?>(.*?)</PMID>', article_xml)
                     title_match = re.search(r'<ArticleTitle>(.*?)</ArticleTitle>', article_xml, re.DOTALL)
@@ -156,13 +160,13 @@ def fetch_pubmed_until_found(virus_name, target_count=5):
                         abstract = abstract_match.group(1).strip() if abstract_match else ""
                         full_text = f"{title} {abstract}"
                         
-                        # 1. 抓取生物活性資訊
+                        # 1. 抓取生物活性資訊 (IC50, EC50, Ki, Kd)
                         act_type, val, unit, relation = extract_bioactivity_from_text(full_text)
                         
                         # 2. 抓取突變點 (RdRP Mutation)
                         mutations = extract_mutations_from_text(full_text)
                         
-                        # 3. 提取標題/摘要中的化合物詞彙並獲取 SMILES
+                        # 3. 提取標題/摘要中的化合物詞彙並獲取 SMILES 結構
                         smiles, inchikey = "N/A", "N/A"
                         words = re.findall(r'\b[A-Za-z0-9\-]{4,25}\b', full_text)
                         for word in words:
@@ -171,32 +175,31 @@ def fetch_pubmed_until_found(virus_name, target_count=5):
                                 if smiles != "N/A":
                                     break
 
-                        records.append({
-                            "Organism": virus_name,
-                            "Target Name": f"Literature: {title[:70]}...",
-                            "RdRP Mutation": mutations,  # 📍 放在 Target Name 下一欄
-                            "UniProt ID": "N/A",
-                            "NCBI Gene ID": f"PubMed_PMID:{pmid}",
-                            "NCBI Protein ID": "N/A",
-                            "PubChem CID": f"PubMed:{pmid}",
-                            "Standard Type": act_type,
-                            "Standard Value": str(val),
-                            "Standard Units": unit,
-                            "Standard Relation": relation,
-                            "Canonical SMILES": smiles,
-                            "InChIKey": inchikey
-                        })
-                        
-                        if len(records) >= target_count:
-                            break
+                        # 🎯 條件判斷：僅留下「具備有效生物活性數值」或「成功對照出 SMILES 結構」的文獻紀錄
+                        if val != "N/A" or smiles != "N/A":
+                            records.append({
+                                "Organism": virus_name,
+                                "Target Name": f"Literature: {title[:70]}...",
+                                "RdRP Mutation": mutations,  # 📍 Target Name 下一欄
+                                "UniProt ID": "N/A",
+                                "NCBI Gene ID": f"PubMed_PMID:{pmid}",
+                                "NCBI Protein ID": "N/A",
+                                "PubChem CID": f"PubMed:{pmid}",
+                                "Standard Type": act_type if act_type != "N/A" else "Literature Record",
+                                "Standard Value": str(val),
+                                "Standard Units": unit if unit != "N/A" else "PubMed Record",
+                                "Standard Relation": relation,
+                                "Canonical SMILES": smiles,
+                                "InChIKey": inchikey
+                            })
 
-            retstart += batch_size  # 自動翻至下一頁繼續搜尋
-            
+            retstart += batch_size  # 自動推進至下一頁，直到掃描完 count 總數
+
         except Exception as e:
-            print(f"  ⚠️ [PubMed] 搜尋發生異常: {e}")
+            print(f"  ⚠️ [PubMed] 搜尋過程發生異常: {e}")
             break
 
-    print(f"  ✨ [PubMed] 成功獲取 {len(records)} 筆詳細文獻數據！")
+    print(f"  ✨ [PubMed] 掃描完畢！共採集到 {len(records)} 筆具備活性資訊或結構的有效文獻資料！")
     return records
 
 def get_cids_by_virus(query_term, max_results=20):
@@ -252,7 +255,7 @@ def get_bioassay_data(cid):
                 if activity_type.upper() in ["IC50", "EC50", "KI", "KD"] and str(activity_val).strip() != "":
                     records.append({
                         "Target Name": cell[i_target] if i_target != -1 and i_target < len(cell) else "",
-                        "RdRP Mutation": "N/A",  # 📍 放在 Target Name 下一欄
+                        "RdRP Mutation": "N/A",  # 📍 Target Name 下一欄
                         "Standard Type": activity_type,
                         "Standard Value": activity_val,
                         "Standard Units": cell[i_unit] if i_unit != -1 and i_unit < len(cell) else "",
@@ -288,7 +291,7 @@ def get_chembl_activity_data(virus_name, max_results=5):
                     records.append({
                         "Organism": virus_name,
                         "Target Name": f"{target_pref_name} (ChEMBL)",
-                        "RdRP Mutation": "N/A",  # 📍 放在 Target Name 下一欄
+                        "RdRP Mutation": "N/A",  # 📍 Target Name 下一欄
                         "UniProt ID": act.get("target_chembl_id", "N/A"),
                         "NCBI Gene ID": "N/A",
                         "NCBI Protein ID": "N/A",
@@ -303,7 +306,7 @@ def get_chembl_activity_data(virus_name, max_results=5):
             if records:
                 print(f"  ✨ [ChEMBL] 成功取得 {len(records)} 筆 ChEMBL 活性數據！")
     except Exception as e:
-        print(f"  ⚠️️ [ChEMBL] 檢索失敗: {e}")
+        print(f"  ⚠️ [ChEMBL] 檢索失敗: {e}")
         
     return records
 
@@ -378,7 +381,7 @@ def generate_email_summary(df, selected_virus):
     
     report_lines = [
         "==========================================",
-        "  PubChem / ChEMBL / PubMed 無限制抽樣每日分析報告",
+        "  PubChem / ChEMBL / PubMed 全量搜尋每日分析報告",
         "==========================================",
         f"📅 執行時間: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
         f"🎯 今日抽樣病毒: {selected_virus}",
@@ -442,10 +445,10 @@ def main():
     if chembl_records:
         assays_found.extend(chembl_records)
 
-    # 3. 第三階段：PubChem 與 ChEMBL 若無，開啟 PubMed 【無限翻頁檢索】模式直到找到資料
+    # 3. 第三階段：若前兩者無資料，觸發 PubMed 全量翻頁檢索（無上限掃描完所有文獻，僅收錄具備活性或結構的資料）
     if not assays_found:
-        print(f"  ⚪ [PubChem/ChEMBL] 無數據，開啟 PubMed 無限制連鎖檢索...")
-        pubmed_records = fetch_pubmed_until_found(selected_virus, target_count=5)
+        print(f"  ⚪ [PubChem/ChEMBL] 無數據，開啟 PubMed 全量無上限連鎖檢索...")
+        pubmed_records = fetch_pubmed_until_found(selected_virus)
         if pubmed_records:
             assays_found.extend(pubmed_records)
 
