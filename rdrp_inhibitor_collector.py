@@ -313,5 +313,47 @@ def main():
     df = pd.DataFrame(all_rows)
     update_google_sheet(df)
 
-if __name__ == "__main__":
-    main()
+def generate_email_summary(df):
+    """分析抓取結果並產生報告寫入 data/email_summary.txt"""
+    os.makedirs("data", exist_ok=True)
+    
+    total_records = len(df)
+    active_drugs = df[df["PubChem CID"] != "No Active Inhibitor Found"]
+    
+    # 計算各病毒藥物統計
+    summary_by_virus = active_drugs.groupby("Organism")["PubChem CID"].nunique()
+    
+    report_lines = [
+        "==========================================",
+        "  PubChem RNA 病毒 RdRP 抑制劑每日分析報告",
+        "==========================================",
+        f"📅 執行時間: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+        f"📊 總檢索紀錄數: {total_records} 筆",
+        f"💊 成功找到活性藥物/化合物的病毒數: {len(summary_by_virus)} 種",
+        "------------------------------------------\n",
+        "【各病毒有效抑制劑 (CID) 數量統計】:"
+    ]
+    
+    for virus, count in summary_by_virus.items():
+        report_lines.append(f"  • {virus}: {count} 個化合物")
+        
+    report_lines.extend([
+        "\n------------------------------------------",
+        "【活性類型 (Standard Type) 分布】:"
+    ])
+    
+    type_counts = active_drugs["Standard Type"].value_counts()
+    for stype, count in type_counts.items():
+        report_lines.append(f"  • {stype}: {count} 筆試驗數據")
+
+    report_lines.extend([
+        "\n------------------------------------------",
+        "🔗 最新數據已完整同步至 Google Sheet 試算表。",
+        "=========================================="
+    ])
+    
+    # 寫入文字檔供 GitHub Actions 讀取寄信
+    with open("data/email_summary.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(report_lines))
+        
+    print("✨ 已成功產生每日分析報告 data/email_summary.txt！")
