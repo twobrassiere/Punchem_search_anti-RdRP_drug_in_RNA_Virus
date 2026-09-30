@@ -1,52 +1,54 @@
-name: Daily AntiviralDB RdRP Google Sheet Sync
+name: Daily PubChem RdRP Inhibitor to Google Sheet & Email Report
 
 on:
   schedule:
-    # 每 12 小時執行一次 (UTC 00:00 與 12:00，相當於台灣時間 08:00 與 20:00)
-    - cron: '0 */12 * * *'
+    # 每天台灣時間 08:00 (UTC 00:00) 執行
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
-  run-sync:
+  build-and-run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          pip install requests pandas gspread google-auth tqdm
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
-      - name: Run script
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SA_KEY }}
-        run: python rdrp_inhibitor_collector.py
+    - name: Run Fetch Script, Update Sheet & Generate Summary
+      env:
+        GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      run: |
+        python scripts/fetch_rdrp_inhibitors.py
 
-      # -------------------------------------------------------------
-      # 執行成功或失敗均觸發發送 Email 通知
-      # -------------------------------------------------------------
-      - name: Send status notification email
-        if: always() # 確保前一步驟無論成功或失敗都會執行此 Step
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "GitHub Action [${{ job.status }}]: Daily AntiviralDB RdRP Sync"
-          # 若 Secrets 中的 MAIL_TO 缺失，預設退回使用 MAIL_USERNAME 作為收件人，防止報錯
-          to: ${{ secrets.MAIL_TO || secrets.MAIL_USERNAME }}
-          from: "GitHub Actions Automator <${{ secrets.MAIL_USERNAME }}>"
-          body: |
-            Daily AntiviralDB RdRP Google Sheet Sync 工作已完成。
+    # 成功後：寄送分析摘要報告 Email
+    - name: Send Summary Email on Success
+      if: success()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        username: ${{ secrets.MAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: "📊 [每日自動報告] PubChem RNA 病毒 RdRP 抑制劑更新與數據分析"
+        to: ${{ secrets.RECEIVER_EMAIL }}
+        from: "PubChem Automation Bot"
+        body: file://data/email_summary.txt # 讀取 Python 產出的分析報告檔案
 
-            * 執行結果 (Status): ${{ job.status }}
-            * 觸發事件 (Event): ${{ github.event_name }}
-            * 觸發分支 (Branch): ${{ github.ref_name }}
-            * 紀錄日誌 (Run URL): https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    # 失敗時：發送 Discord 失敗提醒
+    - name: Send Discord Notification on Failure
+      if: failure()
+      uses: IlshatSk/discord-webhook-action@v1.0.0
+      with:
+        webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
+        content: "🚨 **[PubChem to Google Sheet 執行失敗]**\n請前往 GitHub Actions 查看 Log。"
